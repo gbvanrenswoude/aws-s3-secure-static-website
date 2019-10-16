@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Static website hosting with WAF and CloudFront'
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: The DNS name of an existing Amazon Route 53 hosted zone (Domainname.com).
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: must be a valid DNS zone name.
+
+  FullDomainName:
+    Type: String
+    Description: Domain name for the static website (something.DomainName.com).
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: must be a valid DNS name.
+
+  AcmCertificateArn:
+    Type: String
+    Description: the Amazon Resource Name (ARN) of an AWS Certificate Manager (ACM) certificate used for serving the static website via https.
+    AllowedPattern: "arn:aws:acm:.*"
+# use https://binx.io/blog/2018/10/05/automated-provisioning-of-acm-certificates-using-route53-in-cloudformation/ to automatically vend certs in this stack
+
+  AllowedCIDR:
+    Description: Allowed IP Range for WAF
+    Type: String
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: 'Delete'
+    Properties:
+      BucketName: !Ref FullDomainName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      AccessControl: 'Private'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:GetObject'
+            Effect: 'Allow'
+            Principal:
+              CanonicalUser: !GetAtt CfOriginAccessIdentity.S3CanonicalUserId
+            Resource:
+              - !Sub 'arn:aws:s3:::${WebsiteBucket}/*'
+      Bucket: !Ref WebsiteBucket
+
+  CfOriginAccessIdentity:
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: 'Access S3 bucket content only through CloudFront'
+
+  WebsiteCloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Cloudfront Distribution pointing to S3 bucket
+        WebACLId:
+          Ref: "StaticWebsiteWebACL"
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.DomainName
+            Id: !Sub 's3-origin-${WebsiteBucket}'
+            OriginPath: ''
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CfOriginAccessIdentity}'
+        Enabled: true
+        HttpVersion: 'http2'
+        DefaultRootObject: index.html
+        Aliases:
+        - !Ref 'FullDomainName'
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - 'HEAD'
+            - 'GET'
+          CachedMethods:
+            - 'HEAD'
+            - 'GET'
+          Compress: false
+          DefaultTTL: 86400
+          ForwardedValues:
+            Cookies:
+              Forward: 'none'
+            Headers:
+              - 'Origin'
+            QueryString: false
+          MaxTTL: 31536000
+          MinTTL: 86400
+          TargetOriginId: !Sub 's3-origin-${WebsiteBucket}'
+          ViewerProtocolPolicy: 'redirect-to-https'
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+
+  WebsiteDNSName:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Join ['', [!Ref 'DomainName', .]]
+      RecordSets:
+      - Name: !Ref 'FullDomainName'
+        Type: A
+        AliasTarget:
+          HostedZoneId: Z2FDTNDATAQYW2
+          DNSName: !GetAtt [WebsiteCloudfrontDistribution, DomainName]
+
+  StaticWebsiteWebACL:
+    Type: "AWS::WAF::WebACL"
+    Properties:
+      Name: "WebACL to with 1 IP restriction rule"
+      DefaultAction:
+        Type: "BLOCK"
+      MetricName: "MyWebACL"
+      Rules:
+        -
+          Action:
+            Type: "ALLOW"
+          Priority: 1
+          RuleId:
+            Ref: "AllowedCIDRIPSetRule"
+  AllowedCIDRIPSetRule:
+    Type: "AWS::WAF::Rule"
+    Properties:
+      Name: "AllowedCIDRIPSetRules"
+      MetricName: "AllowedCIDRIPSetRule"
+      Predicates:
+        -
+          DataId:
+            Ref: "MyIPSetWhitelist"
+          Negated: false
+          Type: "IPMatch"
+  MyIPSetWhitelist:
+    Type: "AWS::WAF::IPSet"
+    Properties:
+      Name: "IPSet for whitelisted IP adresses"
+      IPSetDescriptors:
+        -
+          Type: "IPV4"
+          Value: !Ref AllowedCIDR
+
+Outputs:
+  BucketName:
+    Value: !Ref 'WebsiteBucket'
+    Description: Name of S3 bucket to hold website content
+  CloudfrontEndpoint:
+    Value: !GetAtt [WebsiteCloudfrontDistribution, DomainName]
+    Description: Endpoint for Cloudfront distribution
+  FullDomain:
+    Value: !Ref 'FullDomainName'
+    Description: Full DomainName
